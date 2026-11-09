@@ -1,0 +1,8 @@
+.build/
+dist/
+.DS_Store
+VERIFICATION.md
+tasks/
+PRODUCT.md
+DESIGN.md
+assets/concepts/
