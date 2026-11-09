@@ -92,9 +92,11 @@ private func search(_ pulls: [String] = [], total: Int? = nil, incomplete: Bool 
     "{\"total_count\":\(total ?? pulls.count),\"incomplete_results\":\(incomplete),\"items\":[\(pulls.joined(separator: ","))]}"
 }
 
-private func comment(_ id: Int, by login: String = "alice", at offset: TimeInterval = 1, repository: String = "owner/repo") -> String {
-    """
-    {"id":\(id),"user":{"login":"\(login)"},"body":"Please check this","html_url":"https://github.com/\(repository)/pull/1#issuecomment-\(id)","created_at":"\(iso(offset))"}
+private func comment(_ id: Int, by login: String = "alice", at offset: TimeInterval = 1, repository: String = "owner/repo", body: String = "Please check this", replyingTo: Int? = nil) -> String {
+    let parent = replyingTo.map { ",\"in_reply_to_id\":\($0)" } ?? ""
+    let encodedBody = String(data: try! JSONEncoder().encode(body), encoding: .utf8)!
+    return """
+    {"id":\(id),"user":{"login":"\(login)"},"body":\(encodedBody),"html_url":"https://github.com/\(repository)/pull/1#issuecomment-\(id)","created_at":"\(iso(offset))"\(parent)}
     """
 }
 
@@ -106,14 +108,20 @@ private func review(_ id: Int, by login: String = "alice", at offset: TimeInterv
 }
 
 private func initial(_ pulls: [String] = [pull()], closed: [String] = []) -> [Reply] {
-    [Reply("/user", "{\"login\":\"sarang\"}"),
-     Reply("/search/issues", search(pulls), queryContains: "is:open"),
-     Reply("/search/issues", search(closed), queryContains: "is:closed")]
+    [Reply("/user", "{\"login\":\"sarang\"}")] + searches(pulls, closed: closed)
 }
 
-private func searches(_ pulls: [String] = [pull()], closed: [String] = []) -> [Reply] {
-    [Reply("/search/issues", search(pulls), queryContains: "is:open"),
+private func replySearches(_ commented: [String] = [], closedCommented: [String] = [], reviewed: [String] = [], closedReviewed: [String] = []) -> [Reply] {
+    [Reply("/search/issues", search(commented), queryContains: "commenter:sarang -author:sarang"),
+     Reply("/search/issues", search(closedCommented), queryContains: "is:closed"),
+     Reply("/search/issues", search(reviewed), queryContains: "reviewed-by:sarang -author:sarang"),
+     Reply("/search/issues", search(closedReviewed), queryContains: "is:closed")]
+}
+
+private func searches(_ pulls: [String] = [pull()], closed: [String] = [], commented: [String] = [], closedCommented: [String] = [], reviewed: [String] = [], closedReviewed: [String] = []) -> [Reply] {
+    [Reply("/search/issues", search(pulls), queryContains: "author:sarang"),
      Reply("/search/issues", search(closed), queryContains: "is:closed")]
+        + replySearches(commented, closedCommented: closedCommented, reviewed: reviewed, closedReviewed: closedReviewed)
 }
 
 private func endpoints(_ id: Int = 1, issue: [String] = [], inline: [String] = [], reviews: [String] = [], repository: String = "owner/repo") -> [Reply] {
@@ -160,7 +168,7 @@ private struct Harness {
     let second = try await h.monitor.poll()
     #expect(second.events.isEmpty)
     #expect(await h.transport.remaining == 0)
-    #expect(await h.transport.requests.count == 8)
+    #expect(await h.transport.requests.count == 16)
     let contents = try String(contentsOf: h.stateURL, encoding: .utf8)
     #expect(!contents.contains("fixture-token"))
     let attributes = try FileManager.default.attributesOfItem(atPath: h.stateURL.path)
@@ -288,8 +296,8 @@ private struct Harness {
     } catch MonitorError.retryAfter(let delay, _) { #expect(delay == 302) }
 
     let adaptive = Harness([
-        Reply("/user", "{\"login\":\"sarang\"}", headers: ["x-ratelimit-remaining": "26", "x-ratelimit-reset": reset]),
-        Reply("/search/issues", search()), Reply("/search/issues", search())])
+        Reply("/user", "{\"login\":\"sarang\"}", headers: ["x-ratelimit-remaining": "26", "x-ratelimit-reset": reset])]
+        + searches([]))
     defer { adaptive.clean() }
     #expect(try await adaptive.monitor.poll().nextDelay == 302)
 }
@@ -331,13 +339,13 @@ private struct Harness {
         Reply("/user", "{\"login\":\"sarang\"}"),
         Reply("/search/issues", search([pull()], total: 2), headers: ["link": link]),
         Reply("/search/issues", search([pull(2)], total: 2), queryContains: "page=2"),
-        Reply("/search/issues", search())] + endpoints() + endpoints(2))
+        Reply("/search/issues", search())] + replySearches() + endpoints() + endpoints(2))
     defer { h.clean() }
     let result = try await h.monitor.poll()
     #expect(result.prCount == 2)
     #expect(result.openPRs.map(\.id) == [1, 2])
     #expect(await h.transport.remaining == 0)
-    #expect(await h.transport.requests.count == 10)
+    #expect(await h.transport.requests.count == 14)
 }
 
 @Test func openPRLinksExcludeClosedAndSortByLatestUpdateWithoutMoreRequests() async throws {
@@ -352,7 +360,7 @@ private struct Harness {
     #expect(result.openPRs.first?.repository == "owner/repo")
     #expect(result.openPRs.first?.url == URL(string: "https://github.com/owner/repo/pull/2"))
     #expect(result.openPRs.first?.updatedAt == epoch.addingTimeInterval(30))
-    #expect(await h.transport.requests.count == 15)
+    #expect(await h.transport.requests.count == 19)
     #expect(await h.transport.remaining == 0)
 }
 
@@ -549,10 +557,11 @@ private struct Harness {
     _ = try await h.monitor.configure(mode: .repositories, entries: ["owner/repo", "owner/new"])
     await h.transport.append([
         Reply("/search/issues", search([pull(2, updated: 121, repository: "owner/new")]), queryContains: "repo:owner/new"),
-        Reply("/search/issues", search(), queryContains: "repo:owner/new"),
+        Reply("/search/issues", search(), queryContains: "repo:owner/new")]
+        + replySearches() + [
         Reply("/search/issues", search([pull()]), queryContains: "repo:owner/repo"),
         Reply("/search/issues", search(), queryContains: "repo:owner/repo")]
-        + endpoints() + endpoints(2, issue: [comment(1, at: 60, repository: "owner/new"), comment(2, at: 121, repository: "owner/new")], repository: "owner/new"))
+        + replySearches() + endpoints() + endpoints(2, issue: [comment(1, at: 60, repository: "owner/new"), comment(2, at: 121, repository: "owner/new")], repository: "owner/new"))
     #expect(try await h.monitor.poll().events.map(\.id) == ["issue:2"])
 }
 
@@ -563,7 +572,7 @@ private struct Harness {
     await h.transport.append([
         Reply("/search/issues", search([pull(1, repository: "company/tools"), pull(2, repository: "company-other/tools")]), queryContains: "org:company"),
         Reply("/search/issues", search(), queryContains: "org:company")]
-        + endpoints(1, repository: "company/tools"))
+        + replySearches() + endpoints(1, repository: "company/tools"))
     let result = try await h.monitor.poll()
     #expect(result.prCount == 1)
     #expect(result.openPRs.map(\.repository) == ["company/tools"])
@@ -640,5 +649,173 @@ private struct Harness {
     #expect(saved.login == "other")
     #expect(!saved.initialComplete)
     #expect(saved.outbox.isEmpty)
+    #expect(await h.transport.remaining == 0)
+}
+
+private func responseEndpoints(_ id: Int = 1, issue: [String] = [], inline: [String] = [], repository: String = "owner/repo") -> [Reply] {
+    Array(endpoints(id, issue: issue, inline: inline, repository: repository).prefix(2))
+}
+
+@Test func othersPRsOnlyNotifyRepliesInParticipatingThreadsAndExplicitMentions() async throws {
+    let root = comment(1, by: "sarang", at: -20)
+    let h = Harness(Array(initial([]).dropLast(4)) + replySearches([pull()]) + responseEndpoints(inline: [root]))
+    defer { h.clean() }
+    #expect(try await h.monitor.poll().events.isEmpty)
+    h.clock.advance()
+    await h.transport.append(searches([], commented: [pull(updated: 60)]) + responseEndpoints(
+        issue: [comment(10), comment(11, body: "@sarang please check"), comment(12, body: "@sarang-extra please check"),
+                comment(13, body: "email@sarang"), comment(14, by: "sarang", body: "@sarang"), comment(15, body: "Hi @SARANG!")],
+        inline: [root, comment(2, replyingTo: 1), comment(3, by: "sarang", replyingTo: 1),
+                 comment(4), comment(5, replyingTo: 4), comment(6, at: -30),
+                 comment(7, by: "sarang", at: -10, replyingTo: 6), comment(8, replyingTo: 6),
+                 comment(9, at: -20, replyingTo: 6)]))
+    let result = try await h.monitor.poll()
+    #expect(Set(result.events.map(\.id)) == ["issue:11", "issue:15", "reviewComment:2", "reviewComment:8"])
+    #expect(result.events.filter { $0.id.hasPrefix("issue:") }.allSatisfy { $0.title.contains("mentioned you on") })
+    #expect(result.events.filter { $0.id.hasPrefix("reviewComment:") }.allSatisfy { $0.title.contains("replied on") })
+    #expect(result.openPRs.isEmpty)
+    try await h.monitor.acknowledge(ids: result.events.map(\.id))
+    h.clock.advance()
+    await h.transport.append(searches([], commented: [pull(updated: 60)]))
+    #expect(try await h.monitor.poll().events.isEmpty)
+    #expect(await h.transport.remaining == 0)
+}
+
+@Test func reviewAndCommentDiscoveryDeduplicateWithoutChangingAuthoredAlerts() async throws {
+    let other = pull(2)
+    let ownRoot = comment(20, by: "sarang", at: -20)
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}")]
+                    + searches([pull()], commented: [other, pull()], reviewed: [other])
+                    + endpoints() + responseEndpoints(2, inline: [ownRoot]))
+    defer { h.clean() }
+    let baseline = try await h.monitor.poll()
+    #expect(baseline.prCount == 2)
+    #expect(baseline.openPRs.map(\.id) == [1])
+    h.clock.advance()
+    await h.transport.append(searches([pull(updated: 60)], closedCommented: [pull(2, updated: 60)], closedReviewed: [pull(2, updated: 60)])
+        + endpoints(issue: [comment(1)], reviews: [review(2)])
+        + responseEndpoints(2, inline: [ownRoot, comment(21, replyingTo: 20)]))
+    let events = try await h.monitor.poll().events
+    #expect(Set(events.map(\.id)) == ["issue:1", "review:2", "reviewComment:21"])
+    #expect(await h.transport.requests.filter { $0.url?.path == "/repos/owner/repo/pulls/2/comments" }.count == 2)
+    #expect(await h.transport.requests.filter { $0.url?.path == "/repos/owner/repo/pulls/2/reviews" }.isEmpty)
+    #expect(await h.transport.remaining == 0)
+}
+
+@Test func completeInlinePaginationResolvesReplyAncestryAcrossPages() async throws {
+    let root = comment(100, at: -30)
+    let own = comment(101, by: "sarang", at: -20, replyingTo: 100)
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}")] + searches([], reviewed: [pull()])
+                    + responseEndpoints(inline: [root, own]))
+    defer { h.clean() }
+    _ = try await h.monitor.poll()
+    h.clock.advance()
+    let link = "<https://api.github.com/repos/owner/repo/pulls/1/comments?per_page=100&page=2>; rel=\"next\""
+    await h.transport.append(searches([], reviewed: [pull(updated: 60)]) + [
+        Reply("/repos/owner/repo/issues/1/comments", "[]"),
+        Reply("/repos/owner/repo/pulls/1/comments", "[\(root),\(own)]", headers: ["link": link]),
+        Reply("/repos/owner/repo/pulls/1/comments", "[\(comment(102, replyingTo: 101)),\(comment(103, replyingTo: 102))]", queryContains: "page=2")])
+    #expect(Set(try await h.monitor.poll().events.map(\.id)) == ["reviewComment:102", "reviewComment:103"])
+    #expect(await h.transport.remaining == 0)
+}
+
+@Test func replyUpgradeEstablishesQuietBaselineAndPreservesAuthoredStateAndOutbox() async throws {
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}")]
+                    + searches([pull(updated: 60)], commented: [pull(2, updated: 60)])
+                    + endpoints(issue: [comment(2)])
+                    + responseEndpoints(2, issue: [comment(4, body: "@sarang old mention")],
+                                        inline: [comment(5, by: "sarang", at: -20), comment(6, replyingTo: 5)]))
+    defer { h.clean() }
+    var saved = try #require(try StateFile(url: h.stateURL).read())
+    saved.initialComplete = true
+    saved.prs["1"] = PRState(updatedAt: epoch, cursors: ["issue": EventCursor(ids: [1])], repository: "owner/repo")
+    saved.outbox = [PREvent(id: "issue:77", title: "Waiting", body: "", url: URL(string: "https://github.com/owner/repo/pull/1")!, date: epoch)]
+    try StateFile(url: h.stateURL).write(saved)
+    let upgraded = try await h.monitor.poll()
+    #expect(Set(upgraded.events.map(\.id)) == ["issue:2", "issue:77"])
+    #expect(try StateFile(url: h.stateURL).read()?.replyMonitorStart != nil)
+    try await h.monitor.acknowledge(ids: upgraded.events.map(\.id))
+    h.clock.advance()
+    await h.transport.append(searches([pull(updated: 60)], commented: [pull(2, updated: 120)])
+        + responseEndpoints(2, inline: [comment(5, by: "sarang", at: -20), comment(6, replyingTo: 5), comment(7, at: 100, replyingTo: 5)]))
+    #expect(try await h.monitor.poll().events.map(\.id) == ["reviewComment:7"])
+}
+
+@Test func failedReplyBaselineRetriesQuietlyAndDoesNotPersistPartialCursors() async throws {
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}")] + searches([], commented: [pull()]) + [
+        Reply("/repos/owner/repo/issues/1/comments", "[]"),
+        Reply("/repos/owner/repo/pulls/1/comments", "{}", status: 500)])
+    defer { h.clean() }
+    let before = try Data(contentsOf: h.stateURL)
+    await #expect(throws: MonitorError.self) { try await h.monitor.poll() }
+    #expect(try Data(contentsOf: h.stateURL) == before)
+    h.clock.advance()
+    let own = comment(1, by: "sarang", at: -20)
+    await h.transport.append(searches([], commented: [pull(updated: 60)]) + responseEndpoints(inline: [own, comment(2, replyingTo: 1)]))
+    #expect(try await h.monitor.poll().events.isEmpty)
+    h.clock.advance()
+    await h.transport.append(searches([], commented: [pull(updated: 120)]) + responseEndpoints(inline: [own, comment(2, replyingTo: 1), comment(3, at: 100, replyingTo: 1)]))
+    #expect(try await h.monitor.poll().events.map(\.id) == ["reviewComment:3"])
+}
+
+@Test func replyDiscoveryStaysScopedAndIncludesClosedReviewedPulls() async throws {
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}")]
+                    + searches([], commented: [pull(2, repository: "other/private")], closedReviewed: [pull(3)])
+                    + responseEndpoints(3))
+    defer { h.clean() }
+    #expect(try await h.monitor.poll().prCount == 1)
+    let requests = await h.transport.requests
+    #expect(requests.allSatisfy { !$0.url!.path.contains("other/private") })
+    let queries = requests.filter { $0.url?.path == "/search/issues" }.map { $0.url!.query!.removingPercentEncoding! }
+    #expect(queries.count == 6)
+    #expect(queries.allSatisfy { $0.contains("repo:owner/repo") })
+    #expect(queries.filter { $0.contains("is:closed") }.allSatisfy { $0.contains("updated:>=") })
+    #expect(await h.transport.remaining == 0)
+}
+
+@Test func searchRatePauseResumesAtTheUnfinishedParticipationQuery() async throws {
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}"),
+                     Reply("/search/issues", search()), Reply("/search/issues", search()),
+                     Reply("/search/issues", "{\"message\":\"secondary rate limit\"}", status: 429, headers: ["Retry-After": "60"])])
+    defer { h.clean() }
+    let before = try Data(contentsOf: h.stateURL)
+    await #expect(throws: MonitorError.self) { try await h.monitor.poll() }
+    #expect(try Data(contentsOf: h.stateURL) == before)
+    h.clock.advance()
+    await h.transport.append(replySearches())
+    #expect(try await h.monitor.poll().events.isEmpty)
+    #expect(await h.transport.requests.count == 8)
+    #expect(await h.transport.remaining == 0)
+    #expect(try StateFile(url: h.stateURL).read()?.initialComplete == true)
+}
+
+@Test func participationSearchPaginationRetriesTheUnfinishedPageAfterRateLimit() async throws {
+    let link = "<https://api.github.com/search/issues?q=is%3Apr%20commenter%3Asarang%20repo%3Aowner%2Frepo&page=2>; rel=\"next\""
+    let h = Harness([Reply("/user", "{\"login\":\"sarang\"}"),
+                     Reply("/search/issues", search()), Reply("/search/issues", search()),
+                     Reply("/search/issues", search([pull()], total: 2), headers: ["link": link]),
+                     Reply("/search/issues", "{}", status: 429, headers: ["Retry-After": "60"], queryContains: "page=2")])
+    defer { h.clean() }
+    await #expect(throws: MonitorError.self) { try await h.monitor.poll() }
+    #expect(try StateFile(url: h.stateURL).read()?.prs.isEmpty == true)
+    h.clock.advance()
+    await h.transport.append([Reply("/search/issues", search([pull(2)], total: 2), queryContains: "page=2")]
+        + Array(replySearches().dropFirst()) + responseEndpoints() + responseEndpoints(2))
+    let result = try await h.monitor.poll()
+    #expect(result.prCount == 2)
+    #expect(result.events.isEmpty)
+    #expect(await h.transport.requests.filter { $0.url?.query?.contains("page=2") == true }.count == 2)
+    #expect(await h.transport.remaining == 0)
+}
+
+@Test func newlyIndexedConversationsOnlyNotifyResponsesSinceMonitoringBegan() async throws {
+    let h = Harness(initial([]))
+    defer { h.clean() }
+    _ = try await h.monitor.poll()
+    h.clock.advance()
+    await h.transport.append(searches([], reviewed: [pull(updated: 60)]) + responseEndpoints(inline: [
+        comment(1, by: "sarang", at: -100), comment(2, at: -1, replyingTo: 1),
+        comment(3, at: 0, replyingTo: 1), comment(4, at: 20, replyingTo: 1)]))
+    #expect(Set(try await h.monitor.poll().events.map(\.id)) == ["reviewComment:3", "reviewComment:4"])
     #expect(await h.transport.remaining == 0)
 }

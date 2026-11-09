@@ -2,14 +2,18 @@ import AppKit
 import UserNotifications
 import PRPingCore
 import Darwin
+import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
-    private var prItem: NSStatusItem!
     private var openPRs: [OpenPR] = []
     private var activePR: OpenPR?
+    private var browserPR: BrowserPR?
+    private var browserTimer: Timer?
+    private var browserReadInProgress = false
+    private var browserDetectionEnabled = UserDefaults.standard.bool(forKey: "browserDetectionEnabled")
     private var selectedPRURL: String? = UserDefaults.standard.string(forKey: "activePRURL") ?? UserDefaults(suiteName: "dev.sarang.prping")?.string(forKey: "activePRURL")
     private var monitor: Monitor!
     private var scope: WatchScope?
@@ -51,12 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = PRPingLogo.image()
         statusItem.button?.setAccessibilityLabel("Pinga menu")
-        prItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        prItem.button?.target = self
-        prItem.button?.action = #selector(openActivePR)
         updateActivePR()
         statusItem.button?.toolTip = "Pinga"
         center.delegate = self
+        startBrowserDetection()
         rebuildMenu()
         Task {
             do {
@@ -104,7 +106,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         label(permission)
         if let scope, !scope.sources.isEmpty { label("Sources: " + scope.sources.joined(separator: ", ")) }
         action("Manage sources…", #selector(manageSources), key: ",")
+        action(browserDetectionEnabled ? "Turn off open PR detection" : "Enable open PR detection…", #selector(toggleBrowserDetection))
+        if browserDetectionEnabled && !AXIsProcessTrusted() {
+            label("Accessibility access needed for open PR detection")
+            action("Open Accessibility settings…", #selector(openAccessibilitySettings))
+        }
         menu.addItem(.separator())
+        if let browserPR, scope?.allows(url: browserPR.url) == true {
+            action("Open current PR · \(browserPR.repository)#\(browserPR.number)", #selector(openBrowserPR))
+            menu.addItem(.separator())
+        }
         if !openPRs.isEmpty {
             label("Open PRs")
             for pull in openPRs {
@@ -137,7 +148,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         action("Help and setup…", #selector(openHelp))
         action("Quit Pinga", #selector(quit), key: "q")
         statusItem.menu = menu
-        statusItem.button?.toolTip = "Pinga: \(status)"
+        if let browserPR { statusItem.button?.toolTip = "Current PR: \(browserPR.repository)#\(browserPR.number)" }
+        else if let pull = activePR { statusItem.button?.toolTip = "Selected PR: \(pull.repository)#\(pull.number) · \(pull.title)" }
+        else { statusItem.button?.toolTip = "Pinga: \(status)" }
+    }
+
+    private func startBrowserDetection() {
+        browserTimer?.invalidate()
+        guard browserDetectionEnabled else { browserPR = nil; return }
+        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshBrowserPR() }
+        }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common)
+        browserTimer = timer
+        refreshBrowserPR()
+    }
+
+    private func refreshBrowserPR() {
+        guard browserDetectionEnabled else { return }
+        guard AXIsProcessTrusted(), canWatch, let scope else {
+            if browserPR != nil { browserPR = nil; rebuildMenu() }
+            return
+        }
+        guard let pid = BrowserDetector.browserPID() else {
+            if browserPR != nil { browserPR = nil; rebuildMenu() }
+            return
+        }
+        guard !browserReadInProgress else { return }
+        browserReadInProgress = true
+        let generation = sourceGeneration
+        Task {
+            let detected = await Task.detached(priority: .utility) { BrowserDetector.currentPR(pid: pid, scope: scope) }.value
+            browserReadInProgress = false
+            guard browserDetectionEnabled, canWatch, generation == sourceGeneration,
+                  BrowserDetector.browserPID() == pid else { return }
+            if browserPR != detected { browserPR = detected; rebuildMenu() }
+        }
+    }
+
+    @objc private func toggleBrowserDetection() {
+        if browserDetectionEnabled {
+            browserDetectionEnabled = false
+            UserDefaults.standard.set(false, forKey: "browserDetectionEnabled")
+            startBrowserDetection()
+            rebuildMenu()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Show the PR open in your browser"
+        alert.informativeText = "macOS Accessibility access lets Pinga observe and control this Mac. Pinga uses it to read the current browser tab URL. It only keeps GitHub PR links in your selected sources and doesn't save other page URLs. You can turn detection off in this menu."
+        alert.addButton(withTitle: "Enable")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        browserDetectionEnabled = true
+        UserDefaults.standard.set(true, forKey: "browserDetectionEnabled")
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+        startBrowserDetection()
+        rebuildMenu()
+    }
+
+    @objc private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func openBrowserPR() {
+        guard let browserPR, scope?.allows(url: browserPR.url) == true else { return }
+        openGitHub(browserPR.url)
     }
 
     private func schedule(_ delay: TimeInterval) {
@@ -217,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if case MonitorError.sourcesRequired = error {
                 canWatch = false
                 openPRs = []
+                browserPR = nil
                 recent = []
                 updateActivePR()
             }
@@ -233,15 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func updateActivePR() {
         activePR = openPRs.first { $0.url.absoluteString == selectedPRURL } ?? openPRs.first
-        prItem.isVisible = activePR != nil
-        if let pull = activePR {
-            prItem.button?.title = "PR #\(pull.number)"
-            prItem.button?.font = .menuBarFont(ofSize: 0)
-            prItem.button?.toolTip = "\(pull.repository)#\(pull.number) · \(pull.title)\nClick to open in GitHub"
-            prItem.button?.setAccessibilityLabel("Open \(pull.repository) pull request \(pull.number): \(pull.title)")
-        }
     }
-    @objc private func openActivePR() { if let pull = activePR { openGitHub(pull.url) } }
     @objc private func selectPR(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL, openPRs.contains(where: { $0.url == url }) else { return }
         selectedPRURL = url.absoluteString
@@ -259,6 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             self.timer?.invalidate()
             self.canWatch = false
             self.openPRs = []
+            self.browserPR = nil
             self.recent = []
             self.selectedPRURL = nil
             UserDefaults.standard.removeObject(forKey: "activePRURL")
@@ -321,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
             let content = UNMutableNotificationContent()
             content.title = "Pinga is ready"
-            content.body = "New comments and reviews on your PRs will appear here."
+            content.body = "PR comments, reviews and replies will appear here."
             content.sound = .default
             try await center.add(UNNotificationRequest(identifier: "pr-ping-test", content: content, trigger: nil))
             status = "Test notification sent"
@@ -367,7 +440,7 @@ if CommandLine.arguments.contains("--notification-probe") {
         do {
             let content = UNMutableNotificationContent()
             content.title = "Pinga is ready"
-            content.body = "New comments and reviews on your PRs will appear here."
+            content.body = "PR comments, reviews and replies will appear here."
             content.sound = .default
             content.userInfo = ["url": "https://github.com/pulls"]
             try await center.add(UNNotificationRequest(identifier: "pinga-icon-check-\(UUID().uuidString)", content: content, trigger: nil))

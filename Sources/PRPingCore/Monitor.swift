@@ -16,6 +16,7 @@ public actor Monitor {
     private var failures = 0
     private var budgets: [String: RateBudget] = [:]
     private var requestCounts: [String: Int] = [:]
+    private var discoveryProgress: DiscoveryProgress?
 
     public init(stateURL: URL, transport: any HTTPTransport = URLSessionTransport(),
                 tokenProvider: @escaping @Sendable () async throws -> String = { try await GitHubCLI.token() },
@@ -114,7 +115,7 @@ public actor Monitor {
             let started = now()
             let monitorStart = Date(timeIntervalSince1970: floor(started.timeIntervalSince1970))
             var candidate = state ?? MonitorState(login: login, monitorStart: monitorStart)
-            let discovery = try await authoredPulls(login: login, at: started, scope: scope, generation: operation)
+            let discovery = try await discoverPulls(login: login, at: started, scope: scope, generation: operation)
             try checkGeneration(operation)
             let pulls = discovery.monitored
             let reconcile = candidate.lastReconciliation.map { started.timeIntervalSince($0) >= 900 } ?? true
@@ -127,17 +128,23 @@ public actor Monitor {
                 if let saved, saved.repository == pull.repository, saved.updatedAt == pull.updatedAt, !reconcile { continue }
                 var record = saved ?? PRState(updatedAt: pull.updatedAt, repository: pull.repository)
                 let sourceStart = candidate.sourceStarts?[scope.sourceKey(for: pull.repository)] ?? candidate.monitorStart
-                for kind in EventKind.allCases {
+                let authored = discovery.authoredIDs.contains(pull.id)
+                let kinds: [EventKind] = authored ? EventKind.allCases : [.issue, .reviewComment]
+                for kind in kinds {
                     let fetched = try await eventsForPull(pull, kind: kind, generation: operation)
                     try checkGeneration(operation)
                     let previous = record.cursors[kind.rawValue]
+                    let relevantIDs = authored ? Set(fetched.map(\.id)) : responseIDs(in: fetched, kind: kind, login: login)
+                    let baseline = authored ? sourceStart : max(sourceStart, candidate.replyMonitorStart ?? monitorStart)
                     var cursor = EventCursor()
                     for event in fetched {
                         if candidate.initialComplete,
-                           (previous != nil || event.date >= sourceStart),
+                           (authored || candidate.replyMonitorStart != nil),
+                           (previous != nil || event.date >= baseline),
                            previous?.ids.contains(event.id) != true,
+                           relevantIDs.contains(event.id),
                            event.login.caseInsensitiveCompare(login) != .orderedSame {
-                            events.append(event.notification(pull: pull, kind: kind))
+                            events.append(event.notification(pull: pull, kind: kind, response: !authored))
                         }
                         cursor.ids.insert(event.id)
                     }
@@ -149,6 +156,7 @@ public actor Monitor {
             }
             try checkGeneration(operation)
             candidate.initialComplete = true
+            if candidate.replyMonitorStart == nil { candidate.replyMonitorStart = monitorStart }
             if reconcile { candidate.lastReconciliation = started }
             // Acknowledge can run while a network request is suspended. Use the
             // current outbox so this transaction never resurrects an acknowledged event.
@@ -229,51 +237,104 @@ public actor Monitor {
         return user.login
     }
 
-    private func authoredPulls(login: String, at date: Date, scope: WatchScope, generation: UInt64) async throws -> (monitored: [GitHubPull], open: [OpenPR]) {
-        let since = String(ISO8601DateFormatter().string(from: date.addingTimeInterval(-7 * 86_400)).prefix(10))
+    private func discoverPulls(login: String, at date: Date, scope: WatchScope, generation: UInt64) async throws -> (monitored: [GitHubPull], open: [OpenPR], authoredIDs: Set<Int64>) {
+        var progress = discoveryProgress.flatMap {
+            $0.generation == generation && $0.login == login ? $0 : nil
+        } ?? DiscoveryProgress(generation: generation, login: login, started: date)
+        let since = String(ISO8601DateFormatter().string(from: progress.started.addingTimeInterval(-7 * 86_400)).prefix(10))
         let qualifier = scope.mode == .repositories ? "repo" : "org"
         let queries = scope.sources.flatMap { source in
-            ["is:pr author:\(login) \(qualifier):\(source) is:open",
-             "is:pr author:\(login) \(qualifier):\(source) is:closed updated:>=\(since)"]
+            [("author:\(login)", true), ("commenter:\(login) -author:\(login)", false),
+             ("reviewed-by:\(login) -author:\(login)", false)].flatMap { participation, authored in
+                [("is:pr \(participation) \(qualifier):\(source) is:open", authored, true),
+                 ("is:pr \(participation) \(qualifier):\(source) is:closed updated:>=\(since)", authored, false)]
+            }
         }
-        var pulls: [Int64: GitHubPull] = [:]
-        var openIDs: Set<Int64> = []
-        for (index, query) in queries.enumerated() {
+        do {
+        while progress.queryIndex < queries.count {
+            let (query, authored, isOpen) = queries[progress.queryIndex]
             var components = URLComponents(string: "https://api.github.com/search/issues")!
             components.queryItems = [URLQueryItem(name: "q", value: query), URLQueryItem(name: "per_page", value: "100"),
                                      URLQueryItem(name: "sort", value: "updated"), URLQueryItem(name: "order", value: "desc")]
-            var next = components.url
-            var visited: Set<URL> = []
-            var count = 0
+            var next = progress.next ?? components.url
             while let url = next {
-                guard visited.insert(url).inserted, visited.count <= 10 else {
+                guard progress.visited.insert(url).inserted, progress.visited.count <= 10 else {
                     throw MonitorError.api("GitHub search pagination was incomplete. Saved state hasn't advanced")
                 }
                 let response = try await request(url, generation: generation)
                 try checkGeneration(generation)
                 let page: SearchPage = try decode(response.data)
                 guard !page.incompleteResults, page.totalCount <= 1_000 else {
-                    throw MonitorError.api("GitHub couldn't return every authored PR. Saved state hasn't advanced")
+                    throw MonitorError.api("GitHub couldn't return every matching PR. Narrow your sources before checking again. Saved state hasn't advanced")
                 }
-                count += page.items.count
+                progress.count += page.items.count
                 for pull in page.items {
                     guard scope.allows(repository: pull.repository) else { continue }
                     try validatePullURLs(pull)
-                    pulls[pull.id] = pull
-                    if index.isMultiple(of: 2) { openIDs.insert(pull.id) }
-                    else { openIDs.remove(pull.id) }
+                    if progress.pulls[pull.id].map({ $0.updatedAt <= pull.updatedAt }) ?? true { progress.pulls[pull.id] = pull }
+                    if authored {
+                        progress.authoredIDs.insert(pull.id)
+                        if isOpen { progress.openIDs.insert(pull.id) }
+                        else { progress.openIDs.remove(pull.id) }
+                    }
                 }
                 next = try nextPage(response.headers, matching: components.url!)
-                if next == nil, count < page.totalCount {
+                if next == nil, progress.count < page.totalCount {
                     throw MonitorError.api("GitHub search pagination ended early. Saved state hasn't advanced")
                 }
+                progress.next = next
+                if next == nil {
+                    progress.queryIndex += 1
+                    progress.visited = []
+                    progress.count = 0
+                }
+                // Search has a separate small budget. Resume completed pages after a rate pause.
+                discoveryProgress = progress
             }
         }
-        let open = openIDs.compactMap { pulls[$0] }.map {
+        } catch {
+            if case MonitorError.retryAfter = error {} else if discoveryProgress?.generation == generation { discoveryProgress = nil }
+            throw error
+        }
+        discoveryProgress = nil
+        let open = progress.openIDs.compactMap { progress.pulls[$0] }.map {
             OpenPR(id: $0.id, number: $0.number, title: $0.title, url: $0.htmlURL,
                    repository: $0.repository, updatedAt: $0.updatedAt)
         }.sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
-        return (monitored: pulls.values.sorted { $0.id < $1.id }, open: open)
+        return (monitored: progress.pulls.values.sorted { $0.id < $1.id }, open: open, authoredIDs: progress.authoredIDs)
+    }
+
+    private func responseIDs(in events: [GitHubEvent], kind: EventKind, login: String) -> Set<Int64> {
+        if kind == .issue {
+            // Issue comments have no reply relationship, so only explicit mentions are attributable.
+            let pattern = "(?<![A-Za-z0-9_@])@" + NSRegularExpression.escapedPattern(for: login) + "(?![A-Za-z0-9_-])"
+            guard let mentions = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+            return Set(events.filter {
+                mentions.firstMatch(in: $0.body, range: NSRange($0.body.startIndex..., in: $0.body)) != nil
+            }.map(\.id))
+        }
+        let byID = Dictionary(events.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        func root(of event: GitHubEvent) -> Int64? {
+            var current = event
+            var visited: Set<Int64> = []
+            while let parent = current.inReplyToID {
+                guard visited.insert(current.id).inserted else { return nil }
+                // Deleted roots still supply a stable thread ID through in_reply_to_id.
+                guard let ancestor = byID[parent] else { return parent }
+                current = ancestor
+            }
+            return current.id
+        }
+        var participated: [Int64: Date] = [:]
+        for event in events where event.login.caseInsensitiveCompare(login) == .orderedSame {
+            guard let thread = root(of: event) else { continue }
+            participated[thread] = min(participated[thread] ?? event.date, event.date)
+        }
+        return Set(events.filter { event in
+            guard event.inReplyToID != nil, let thread = root(of: event),
+                  let firstParticipation = participated[thread] else { return false }
+            return event.date >= firstParticipation
+        }.map(\.id))
     }
 
     private func validatePullURLs(_ pull: GitHubPull) throws {
@@ -307,12 +368,12 @@ public actor Monitor {
                 for review in reviews where review.state.uppercased() != "PENDING" {
                     guard let date = review.submittedAt else { continue }
                     events.append(GitHubEvent(id: review.id, login: review.user?.login ?? "ghost", body: review.body ?? "",
-                                              url: review.htmlURL, date: date, reviewState: review.state))
+                                              url: review.htmlURL, date: date, reviewState: review.state, inReplyToID: nil))
                 }
             } else {
                 let comments: [GitHubComment] = try decode(response.data)
                 events += comments.map { GitHubEvent(id: $0.id, login: $0.user?.login ?? "ghost", body: $0.body ?? "",
-                                                     url: $0.htmlURL, date: $0.createdAt, reviewState: nil) }
+                                                     url: $0.htmlURL, date: $0.createdAt, reviewState: nil, inReplyToID: $0.inReplyToID) }
             }
             next = try nextPage(response.headers, matching: components.url!)
         }
@@ -433,6 +494,18 @@ public actor Monitor {
     }
 }
 
+private struct DiscoveryProgress {
+    let generation: UInt64
+    let login: String
+    let started: Date
+    var queryIndex = 0
+    var next: URL?
+    var visited: Set<URL> = []
+    var count = 0
+    var pulls: [Int64: GitHubPull] = [:]
+    var openIDs: Set<Int64> = []
+    var authoredIDs: Set<Int64> = []
+}
 private struct RateBudget: Sendable { let remaining: Int; let reset: Date }
 private struct APIMessage: Decodable { let message: String }
 private struct RepositoryReference: Decodable {
@@ -469,7 +542,8 @@ private struct GitHubComment: Decodable {
     let body: String?
     let htmlURL: URL
     let createdAt: Date
-    enum CodingKeys: String, CodingKey { case id, user, body, htmlURL = "html_url", createdAt = "created_at" }
+    let inReplyToID: Int64?
+    enum CodingKeys: String, CodingKey { case id, user, body, htmlURL = "html_url", createdAt = "created_at", inReplyToID = "in_reply_to_id" }
 }
 private struct GitHubReview: Decodable {
     let id: Int64
@@ -490,14 +564,15 @@ private struct GitHubEvent {
     let url: URL
     let date: Date
     let reviewState: String?
+    let inReplyToID: Int64?
 
-    func notification(pull: GitHubPull, kind: EventKind) -> PREvent {
+    func notification(pull: GitHubPull, kind: EventKind, response: Bool = false) -> PREvent {
         let verb: String
         switch reviewState?.uppercased() {
         case "APPROVED": verb = "approved"
         case "CHANGES_REQUESTED": verb = "requested changes on"
         case "DISMISSED": verb = "had a review dismissed on"
-        default: verb = kind == .review ? "reviewed" : "commented on"
+        default: verb = response ? (kind == .issue ? "mentioned you on" : "replied on") : (kind == .review ? "reviewed" : "commented on")
         }
         let snippet = String(body.split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(180))
         let summary = snippet.isEmpty ? pull.title : "\(pull.title)\n\(snippet)"

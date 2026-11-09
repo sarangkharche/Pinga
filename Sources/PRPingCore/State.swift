@@ -23,6 +23,8 @@ struct MonitorState: Codable, Sendable {
     var outbox: [PREvent] = []
     var scope: WatchScope?
     var sourceStarts: [String: Date]?
+    // A separate quiet baseline keeps upgrades from notifying old conversations.
+    var replyMonitorStart: Date?
 }
 
 struct StateFile {
