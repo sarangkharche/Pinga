@@ -17,6 +17,7 @@ enum BrowserDetector {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.15)
         guard let window = element(app, kAXFocusedWindowAttribute as CFString) else { return nil }
+        AXUIElementSetMessagingTimeout(window, 0.15)
         if let url = url(window), let result = BrowserPR.parse(url, scope: scope) { return result }
         var budget = 100
         return findWebArea(window, scope: scope, depth: 0, budget: &budget)
@@ -25,6 +26,7 @@ enum BrowserDetector {
     private static func findWebArea(_ element: AXUIElement, scope: WatchScope, depth: Int, budget: inout Int) -> BrowserPR? {
         guard depth < 7 && budget > 0 else { return nil }
         budget -= 1
+        AXUIElementSetMessagingTimeout(element, 0.15)
         var role: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
            (role as? String) == "AXWebArea" {
