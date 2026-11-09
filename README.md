@@ -6,7 +6,7 @@ Pinga is a small native macOS menu bar app for GitHub pull request comments and 
 
 Requires an Apple Silicon Mac running macOS 13 or later and [GitHub CLI](https://cli.github.com/).
 
-Download [Pinga.zip](https://github.com/sarangkharche/Pinga/releases/download/v0.1.0/Pinga.zip), unzip it and move Pinga.app to Applications.
+Download [Pinga.zip](https://github.com/sarangkharche/Pinga/releases/download/v0.1.1/Pinga.zip), unzip it and move Pinga.app to Applications.
 
 Or install with Homebrew:
 
@@ -18,7 +18,7 @@ brew install --cask sarangkharche/pinga/pinga
 
 This initial build is locally signed and not notarised by Apple. macOS may block its first launch; review the app in System Settings → Privacy & Security if prompted.
 
-The [logo PNG](https://github.com/sarangkharche/Pinga/releases/download/v0.1.0/PRPing.png) is available separately.
+The [logo PNG](https://github.com/sarangkharche/Pinga/releases/download/v0.1.1/PRPing.png) is available separately.
 
 ## Set up
 

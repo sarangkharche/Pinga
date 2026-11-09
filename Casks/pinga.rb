@@ -1,6 +1,6 @@
 cask "pinga" do
-  version "0.1.0"
-  sha256 "322ed23263e9aad8ecd77129d376d23e6d11bf80575dc65e875ad2ae94f018ae"
+  version "0.1.1"
+  sha256 "57f8f0e092fedfd9b5fb0a811fd65b60208627294e7306c296f65ab5e5e55cdf"
 
   url "https://github.com/sarangkharche/Pinga/releases/download/v#{version}/Pinga.zip"
   name "Pinga"

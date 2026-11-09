@@ -17,23 +17,18 @@ enum PRPingLogo {
                 NSColor.labelColor.setStroke()
                 NSColor.labelColor.setFill()
             }
-            let branch = NSBezierPath()
-            branch.lineWidth = 1.45
-            branch.lineCapStyle = .round
-            branch.lineJoinStyle = .round
-            branch.move(to: NSPoint(x: 4, y: 5))
-            branch.line(to: NSPoint(x: 4, y: 13))
-            branch.move(to: NSPoint(x: 12, y: 5))
-            branch.line(to: NSPoint(x: 12, y: 9))
-            branch.curve(to: NSPoint(x: 8.5, y: 13), controlPoint1: NSPoint(x: 12, y: 12), controlPoint2: NSPoint(x: 11, y: 13))
-            branch.stroke()
-            for point in [NSPoint(x: 4, y: 3), NSPoint(x: 4, y: 15), NSPoint(x: 12, y: 3)] {
-                let circle = NSBezierPath(ovalIn: NSRect(x: point.x - 1.7, y: point.y - 1.7, width: 3.4, height: 3.4))
-                circle.lineWidth = 1.35
-                circle.stroke()
-            }
-            if appIcon { NSColor(calibratedRed: 0.40, green: 0.91, blue: 0.76, alpha: 1).setFill() }
-            NSBezierPath(ovalIn: NSRect(x: 13.5, y: 13.5, width: 3, height: 3)).fill()
+            let mark = NSBezierPath()
+            mark.lineWidth = 1.25
+            mark.lineCapStyle = .round
+            mark.lineJoinStyle = .round
+            mark.move(to: NSPoint(x: 5, y: 2.5))
+            mark.line(to: NSPoint(x: 5, y: 15.5))
+            mark.line(to: NSPoint(x: 10, y: 15.5))
+            mark.curve(to: NSPoint(x: 13.5, y: 12.5), controlPoint1: NSPoint(x: 12.5, y: 15.5), controlPoint2: NSPoint(x: 13.5, y: 14.5))
+            mark.line(to: NSPoint(x: 13.5, y: 10.5))
+            mark.curve(to: NSPoint(x: 10, y: 7.5), controlPoint1: NSPoint(x: 13.5, y: 8.5), controlPoint2: NSPoint(x: 12.5, y: 7.5))
+            mark.line(to: NSPoint(x: 5, y: 7.5))
+            mark.stroke()
             return true
         }
         image.isTemplate = !appIcon
