@@ -12,10 +12,13 @@ Or install with Homebrew:
 
 ```sh
 brew tap sarangkharche/pinga https://github.com/sarangkharche/Pinga
+brew trust --cask sarangkharche/pinga/pinga
 brew install --cask sarangkharche/pinga/pinga
 ```
 
 This initial build is locally signed and not notarised by Apple. macOS may block its first launch; review the app in System Settings → Privacy & Security if prompted.
+
+The [logo PNG](https://github.com/sarangkharche/Pinga/releases/download/v0.1.0/PRPing.png) is available separately.
 
 ## Set up
 
